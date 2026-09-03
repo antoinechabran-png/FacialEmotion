@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import queue
+import platform
+import sys
 import threading
 import time
+import traceback
+from collections import deque
+from datetime import datetime, timezone
 from typing import Any
 
 import av
@@ -41,16 +46,70 @@ if "stimulus" not in st.session_state:
     st.session_state.stimulus = ""
 
 
+class AppDiagnostics:
+    """Thread-safe, bounded diagnostic log shared across Streamlit reruns."""
+
+    def __init__(self) -> None:
+        self._lines: deque[str] = deque(maxlen=500)
+        self._lock = threading.Lock()
+
+    def write(self, level: str, message: str) -> None:
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        line = f"{timestamp} [{level}] {message}"
+        with self._lock:
+            self._lines.append(line)
+        # Streamlit Community Cloud captures stdout in Manage app > Logs.
+        print(line, file=sys.stdout, flush=True)
+
+    def text(self) -> str:
+        with self._lock:
+            return "\n".join(self._lines)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._lines.clear()
+
+
+@st.cache_resource
+def get_diagnostics() -> AppDiagnostics:
+    diagnostics = AppDiagnostics()
+    diagnostics.write("INFO", "Application diagnostics initialized")
+    diagnostics.write("INFO", f"Python={sys.version.replace(chr(10), ' ')}")
+    diagnostics.write("INFO", f"Platform={platform.platform()}")
+    diagnostics.write("INFO", f"Streamlit={st.__version__}")
+    try:
+        import cv2
+        import deepface
+        import tensorflow as tf
+        import streamlit_webrtc
+
+        diagnostics.write("INFO", f"OpenCV={cv2.__version__}")
+        diagnostics.write("INFO", f"DeepFace={getattr(deepface, '__version__', 'unknown')}")
+        diagnostics.write("INFO", f"TensorFlow={tf.__version__}")
+        diagnostics.write(
+            "INFO", f"streamlit-webrtc={getattr(streamlit_webrtc, '__version__', 'unknown')}"
+        )
+    except Exception:
+        diagnostics.write("ERROR", "Version inspection failed:\n" + traceback.format_exc())
+    return diagnostics
+
+
+DIAGNOSTICS = get_diagnostics()
+
+
 class EmotionProcessor:
     """Analyze frames off the UI thread without accessing session_state."""
 
-    def __init__(self) -> None:
+    def __init__(self, diagnostics: AppDiagnostics) -> None:
+        self.diagnostics = diagnostics
         self.frame_number = 0
         self.results: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=100)
         self._state_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         self._last_emotion = ""
         self._last_error = ""
+        self._started_at = time.perf_counter()
+        self.diagnostics.write("INFO", "EmotionProcessor created; waiting for video frames")
 
     def _publish(self, result: dict[str, Any]) -> None:
         try:
@@ -69,11 +128,20 @@ class EmotionProcessor:
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         image = frame.to_ndarray(format="bgr24")
         self.frame_number += 1
+        if self.frame_number == 1:
+            height, width = image.shape[:2]
+            self.diagnostics.write(
+                "INFO", f"First video frame received: {width}x{height}, format=bgr24"
+            )
 
         should_analyze = self.frame_number % ANALYZE_EVERY_N_FRAMES == 0
         # async_processing may overlap recv calls; serialize heavy inference.
         if should_analyze and self._inference_lock.acquire(blocking=False):
+            inference_started = time.perf_counter()
             try:
+                self.diagnostics.write(
+                    "DEBUG", f"DeepFace inference started at frame {self.frame_number}"
+                )
                 analysis = DeepFace.analyze(
                     img_path=image,
                     actions=["emotion"],
@@ -97,9 +165,16 @@ class EmotionProcessor:
                 with self._state_lock:
                     self._last_emotion = dominant
                     self._last_error = ""
+                elapsed = time.perf_counter() - inference_started
+                self.diagnostics.write(
+                    "INFO",
+                    f"DeepFace inference succeeded in {elapsed:.2f}s; dominant={dominant}",
+                )
             except Exception as exc:
+                details = traceback.format_exc()
                 with self._state_lock:
                     self._last_error = f"{type(exc).__name__}: {exc}"
+                self.diagnostics.write("ERROR", "DeepFace inference failed:\n" + details)
             finally:
                 self._inference_lock.release()
 
@@ -147,6 +222,10 @@ st.caption(
     "exposure start. The first DeepFace result can take a little longer."
 )
 
+if "diagnostic_header_written" not in st.session_state:
+    DIAGNOSTICS.write("INFO", "New browser session connected to the Streamlit app")
+    st.session_state.diagnostic_header_written = True
+
 identity_col, stimulus_col = st.columns(2)
 with identity_col:
     st.session_state.respondent_id = st.text_input(
@@ -172,7 +251,7 @@ with camera_col:
             },
             "audio": False,
         },
-        video_processor_factory=EmotionProcessor,
+        video_processor_factory=lambda: EmotionProcessor(DIAGNOSTICS),
         async_processing=True,
         video_html_attrs={
             "autoPlay": True,
@@ -187,15 +266,19 @@ with camera_col:
         if context.state.playing:
             st.session_state.exposure_started_at = time.time()
             st.session_state.emotion_log = []
+            DIAGNOSTICS.write("INFO", "User marked exposure start; emotion log cleared")
             st.success("Exposure timer started at t=0.")
         else:
+            DIAGNOSTICS.write("WARNING", "Exposure button clicked while camera disconnected")
             st.error("Start the webcam and allow camera access first.")
     if stop_col.button("⏹ Stop logging", use_container_width=True):
         st.session_state.exposure_started_at = None
+        DIAGNOSTICS.write("INFO", "User stopped emotion logging")
         st.info("Logging stopped. Existing readings are preserved.")
     if clear_col.button("🗑 Clear", use_container_width=True):
         st.session_state.exposure_started_at = None
         st.session_state.emotion_log = []
+        DIAGNOSTICS.write("INFO", "User cleared emotion log")
 
     if context.state.playing:
         st.success("Camera connected.")
@@ -221,6 +304,14 @@ with results_col:
 
     @st.fragment(run_every=1.0)
     def render_results() -> None:
+        state_now = "playing" if context.state.playing else "disconnected"
+        previous_state = st.session_state.get("last_camera_state")
+        if state_now != previous_state:
+            DIAGNOSTICS.write(
+                "INFO", f"WebRTC state changed: {previous_state or 'unknown'} -> {state_now}"
+            )
+            st.session_state.last_camera_state = state_now
+
         error = collect_results(context.video_processor)
         if error:
             st.error(f"DeepFace analysis error: {error}")
@@ -245,6 +336,31 @@ with results_col:
         )
 
     render_results()
+
+st.subheader("Diagnostic log")
+st.caption(
+    "No video images are recorded. This log contains connection state, software "
+    "versions, processing milestones, and error tracebacks."
+)
+
+@st.fragment(run_every=1.0)
+def render_diagnostics() -> None:
+    diagnostic_text = DIAGNOSTICS.text()
+    st.code(diagnostic_text or "No diagnostic events yet.", language="text")
+    log_col, clear_log_col = st.columns([1, 1])
+    log_col.download_button(
+        "Download diagnostic log",
+        data=diagnostic_text.encode("utf-8"),
+        file_name="facial_emotion_diagnostics.log",
+        mime="text/plain",
+        use_container_width=True,
+    )
+    if clear_log_col.button("Clear diagnostic log", use_container_width=True):
+        DIAGNOSTICS.clear()
+        DIAGNOSTICS.write("INFO", "Diagnostic log cleared by user")
+
+
+render_diagnostics()
 
 st.divider()
 st.warning(
