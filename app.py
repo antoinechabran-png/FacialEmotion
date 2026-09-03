@@ -117,7 +117,25 @@ with left:
         video_processor_factory=EmotionProcessor,
         media_stream_constraints={"video": True, "audio": False},
         rtc_configuration={
-            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+            "iceServers": [
+                {"urls": ["stun:stun.l.google.com:19302"]},
+                # Public TURN relay fallback — needed on networks (e.g.
+                # corporate firewalls) that block direct peer-to-peer
+                # WebRTC media. Openrelay is a free/shared TURN service;
+                # fine for piloting, but for a real panel rollout swap
+                # in a dedicated TURN provider (e.g. Twilio) for
+                # reliability and to avoid a shared-capacity service.
+                {
+                    "urls": ["turn:openrelay.metered.ca:80"],
+                    "username": "openrelayproject",
+                    "credential": "openrelayproject",
+                },
+                {
+                    "urls": ["turn:openrelay.metered.ca:443"],
+                    "username": "openrelayproject",
+                    "credential": "openrelayproject",
+                },
+            ]
         },
     )
 
