@@ -4,6 +4,5 @@ deepface==0.0.93
 tf-keras==2.15.1
 tensorflow==2.15.1
 opencv-python-headless==4.9.0.80
-av==11.0.0
 pandas==2.2.2
 numpy==1.26.4
